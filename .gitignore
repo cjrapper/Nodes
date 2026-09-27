@@ -1,0 +1,27 @@
+# 依赖与构建产物
+node_modules/
+.next/
+out/
+next-env.d.ts
+*.tsbuildinfo
+
+# 本地数据库（你的笔记数据 —— 绝对不要提交）
+.data/
+
+# 项目内重定向的 npm 缓存（见 .npmrc）
+.npm-cache/
+
+# 环境变量
+.env
+.env.local
+.env*.local
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+npm-debug.log*

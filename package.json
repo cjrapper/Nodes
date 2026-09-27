@@ -1,0 +1,39 @@
+{
+  "name": "nodes",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Nodes — 本地优先的知识库笔记 + 内置可自定义 AI，以 prompt 前缀缓存命中为核心优化目标",
+  "scripts": {
+    "dev": "next dev -p 3210",
+    "build": "next build",
+    "start": "next start -p 3210",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "check:encoding": "node scripts/check-encoding.mjs src",
+    "test": "node --experimental-strip-types --import ./tests/ts-resolve.mjs --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --disable-warning=ExperimentalWarning tests/run.mjs",
+    "test:integration": "node scripts/integration-run.mjs",
+    "verify": "npm run check:encoding && npm run typecheck && npm test && npm run test:integration"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.475.0",
+    "next": "^16.3.6",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "tailwind-merge": "^3.7.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/react-test-renderer": "^19.3.0",
+    "react-test-renderer": "^19.3.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3"
+  }
+}

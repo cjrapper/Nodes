@@ -1,0 +1,179 @@
+@import "tailwindcss";
+
+/* ------------------------------------------------------------------ *
+ * 设计 token
+ *
+ * 深色主题。刻意用低饱和的冷灰做底、单一青绿做强调 ——
+ * 这是一个长时间盯着的写作工具，不是展示型界面。
+ * ------------------------------------------------------------------ */
+@theme {
+  --color-canvas: #0b0d10;
+  --color-panel: #12151a;
+  --color-raised: #171b21;
+  --color-line: #23282f;
+  --color-ink: #e6e9ee;
+  --color-ink-dim: #98a2b3;
+  --color-ink-faint: #6b7280;
+  --color-accent: #3ddc97;
+  --color-warn: #f5b544;
+  --color-danger: #f2555a;
+  --color-info: #6aa8ff;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC",
+    "Hiragino Sans GB", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+/* 细滚动条，避免在密集面板里喧宾夺主 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-line);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #333a44;
+}
+
+/* ------------------------------------------------------------------ *
+ * 外观变量（由 WorkspaceShell 从工作区设置写入根元素）
+ *
+ * 这几个变量就是"用户可调外观"与"样式实现"之间唯一的接口。
+ * 组件不直接读数据库，CSS 也不关心值从哪来 —— 想再加一个可调项时，
+ * 只需要在 types.ts 里加字段、在这里加一条消费规则。
+ * ------------------------------------------------------------------ */
+:root {
+  --nodes-font-size: 13px;
+  --nodes-code-size: 13px;
+  --nodes-line-height: 1.75;
+  --nodes-font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Microsoft YaHei",
+    "PingFang SC", "Hiragino Sans GB", sans-serif;
+  --nodes-accent: #3ddc97;
+  --nodes-canvas: #0b0d10;
+  --nodes-panel: #12151a;
+  --nodes-raised: #171b21;
+  --nodes-line: #23282f;
+  --nodes-ink: #e6e9ee;
+  --nodes-ink-dim: #98a2b3;
+  --nodes-ink-faint: #6b7280;
+}
+
+/* 渲染后的 Markdown 正文 —— 字号/行高/字体三项外观设置主要作用在这里 */
+.nodes-md {
+  font-family: var(--nodes-font-family);
+  font-size: var(--nodes-font-size);
+  line-height: var(--nodes-line-height);
+}
+.nodes-md code,
+.nodes-md pre,
+.nodes-md kbd,
+.nodes-md samp {
+  font-size: var(--nodes-code-size);
+}
+
+textarea,
+input,
+select {
+  font-family: inherit;
+}
+
+/* 编辑区受字号设置影响，但用属性选择器提高优先级，
+   避免被各处 Tailwind 的 text-[13px] 覆盖掉 —— 
+   行内 style 又会压不住 textarea 的 UA 默认值，所以走 CSS 变量这条路 */
+textarea[data-nodes-editor] {
+  font-size: var(--nodes-font-size);
+  line-height: var(--nodes-line-height);
+  font-family: var(--nodes-font-family);
+}
+
+textarea:focus,
+input:focus,
+select:focus,
+button:focus-visible {
+  outline: none;
+}
+
+/* 闪烁光标：流式输出时跟在文字后面 */
+@keyframes nodes-caret {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+.nodes-caret::after {
+  content: "▍";
+  color: var(--color-accent);
+  animation: nodes-caret 1s steps(1) infinite;
+}
+
+/* 层条形的加载动画 */
+@keyframes nodes-shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+.nodes-shimmer {
+  background-image: linear-gradient(
+    90deg,
+    rgba(61, 220, 151, 0.06) 0%,
+    rgba(61, 220, 151, 0.22) 50%,
+    rgba(61, 220, 151, 0.06) 100%
+  );
+  background-size: 200% 100%;
+  animation: nodes-shimmer 1.6s linear infinite;
+}
+
+/* ------------------------------------------------------------------ *
+ * 图表块
+ *
+ * 节点是可点击的 `<a>`，必须给出手型光标与 hover 反馈 ——
+ * SVG 里的 `<a>` 不会继承网页链接样式，用户根本看不出哪里能点。
+ * ------------------------------------------------------------------ */
+.nodes-diagram svg {
+  max-width: 100%;
+  height: auto;
+  display: block;
+}
+.nodes-diagram a {
+  cursor: pointer;
+}
+.nodes-diagram a:hover rect,
+.nodes-diagram a:hover polygon {
+  filter: brightness(1.35);
+}
+.nodes-diagram a:focus-visible {
+  outline: 2px solid var(--nodes-accent);
+  outline-offset: 2px;
+}
+.nodes-diagram text {
+  font-family: var(--nodes-font-family);
+  /* SVG 文本不参与选中，否则拖图时会刷出一片蓝 */
+  user-select: none;
+}
