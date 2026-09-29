@@ -70,27 +70,124 @@ async function run(toolName: string, args: Record<string, unknown>) {
 }
 
 /* ================================================================== *
- * 红线 1：AI 永远不能删
+ * 策略转变：从「不许做危险动作」改成「每个动作都可撤销」
+ *
+ * 这里曾经断言"工具清单里不存在 delete / update / rename 类工具"，
+ * 也就是早期那条"AI 只能追加"的红线。
+ *
+ * 那条红线**已经按用户要求放开了**，理由写在 `docs/agent-write-policy.md`：
+ * 只能追加的助手当不了导师 —— 它没法说"这两篇该合并""这块放错分类了"
+ * "这段理解是错的"，只能往后面贴补丁。
+ *
+ * ⚠️ 所以这一节不是"删掉了旧测试"，而是**换了判据**：
+ * 以前问"有没有危险工具"，现在问"危险动作是否真的可逆"。
+ * 少了下半部分，这次放开就只是一次没有防护的权限扩张。
  * ================================================================== */
 
-test("工具清单里不存在任何删除类工具（红线 1）", () => {
+test("可重组工具都在清单里（update / rename / delete）", () => {
   const names = toolNames();
-  for (const forbidden of ["delete", "remove", "drop", "trash", "purge"]) {
-    assert.equal(
-      names.some((n) => n.toLowerCase().includes(forbidden)),
-      false,
-      `工具清单里不能出现 ${forbidden} —— 删除对用户的笔记是不可逆的，` +
-        `正确做法是"根本没有这个工具"，而不是"有但要确认"`,
+  for (const required of ["update_doc", "rename_doc", "delete_doc"]) {
+    assert.ok(
+      names.includes(required),
+      `缺少 ${required} —— AI 整理知识需要它，只能追加的助手当不了导师`,
     );
   }
-  // 也不该有能力改写/覆盖既有内容
-  for (const forbidden of ["update", "overwrite", "replace", "edit"]) {
-    assert.equal(
-      names.some((n) => n.toLowerCase().includes(forbidden)),
-      false,
-      `不能有 ${forbidden} 类工具：AI 只允许新增，不允许改写人写的东西`,
+});
+
+test("update_doc 的描述明确允许删减与覆盖（守卫已按要求放开）", () => {
+  /*
+   * 这条守的是**语义而不是实现**：`update_doc` 曾经有一道"原文一字不丢"
+   * 的守卫，描述里写着"必须原样保留，否则会被拒绝"。
+   *
+   * 用户的要求是「原文可以删，或者说是覆盖」—— 那条守卫被放开了。
+   * 如果描述还留着旧措辞，模型会因为怕被拒而不敢删减，
+   * 于是**功能上放开了、行为上没放开**：它在描述里读到禁令就不做了。
+   *
+   * 所以描述必须明说"可以删减"。
+   */
+  const spec = TOOL_SPECS.find((s) => s.definition.name === "update_doc");
+  assert.ok(spec, "update_doc 必须在工具清单里");
+  const desc = spec.definition.description;
+  assert.match(desc, /删减|覆盖/, "描述必须明确允许删减/覆盖，否则模型不敢做");
+  assert.doesNotMatch(
+    desc,
+    /必须原样保留|会被拒绝/,
+    "不能留旧守卫的措辞 —— 那会让模型在行为上自我审查",
+  );
+  // 同时必须告诉它撤销的存在：那是放开之后唯一的约束来源
+  assert.match(desc, /撤销|快照/, "要说明改动可撤销，这既是提醒也是它的责任边界");
+});
+
+test("每个写入类工具都必须登记在某个可撤销类别里", () => {
+  /*
+   * 这是放开之后的**核心不变量**。
+   *
+   * 判据不能是"有没有危险工具"（那正是被放开的），而必须是：
+   * **每一个会改数据的工具，都留下了足以还原的材料。**
+   *
+   * 内容类 → `snapshotMarkdown`；元数据类 → `beforeState`。
+   * 一个既不属于内容类、也不属于元数据类的写入工具 =
+   * 用户被改坏了也退不回去 —— 那才是真正不可接受的状态。
+   *
+   * ⚠️ 这里只保证"工具被登记过"。**撤销确实能还原**由
+   * `undo.test.ts` 对每个工具跑真实撤销来保证 —— 那张表漏登记会在这里变红，
+   * 登记了但撤销实现写错会在那边变红，两层缺一不可。
+   */
+  const contentUndoable = new Set(["append_blocks", "update_doc"]);
+  const metaUndoable = new Set([
+    "create_doc",
+    "create_module",
+    "update_doc",
+    "rename_doc",
+    "delete_doc",
+  ]);
+
+  for (const spec of TOOL_SPECS) {
+    if (!spec.writes) continue;
+    const name = spec.definition.name;
+    assert.ok(
+      contentUndoable.has(name) || metaUndoable.has(name),
+      `写入类工具 ${name} 没有登记撤销材料 —— ` +
+        `放开权限的同时必须保证每个动作都可逆（见 docs/agent-write-policy.md）`,
     );
   }
+
+  // 反向：写类工具不能只有读类的那几个，否则上面这条循环会空转通过
+  assert.ok(
+    TOOL_SPECS.filter((s) => s.writes).length >= 5,
+    "写入类工具应当有若干个，数量异常说明上面的检查可能在空转",
+  );
+});
+
+test("删除工具存在，但含子文档的模块会被拒绝（用户明确要求保留的保护）", async () => {
+  const ws = repo.getWorkspace()!;
+  const parent = repo.createDoc({ workspaceId: ws.id, title: "删除保护-模块", kind: "module" });
+  const child = repo.createDoc({
+    workspaceId: ws.id,
+    parentId: parent.id,
+    title: "删除保护-子文档",
+  });
+
+  const result = await run("delete_doc", { docId: parent.id });
+  assert.equal(result.isError, true, "含子文档的模块必须拒绝删除");
+  assert.match(result.content, /拒绝整棵删除/);
+  // 关键：拒绝之后什么都没动
+  assert.ok(repo.getDoc(parent.id), "被拒绝的删除不能真的删掉它");
+  assert.ok(repo.getDoc(child.id), "子文档也必须原样还在");
+});
+
+test("删除工具对没有子文档的文档生效，且进的是回收站（可恢复）", async () => {
+  // makeDoc 返回 { doc, blocks }，这里要的是 doc
+  const { doc } = makeDoc("删除保护-独立文档", ["要被删掉的内容。"]);
+  const result = await run("delete_doc", { docId: doc.id });
+  assert.equal(result.isError, undefined, `应当删除成功，实际：${result.content}`);
+  assert.equal(repo.getDoc(doc.id), null, "删除后不该还能查到");
+  assert.equal(
+    repo.listDeletedDocs(repo.getWorkspace()!.id).some((d) => d.id === doc.id),
+    true,
+    "必须在回收站里 —— 可恢复是放开删除的前提",
+  );
+  assert.ok(result.beforeState, "删除必须留下元数据快照，否则撤销无从下手");
 });
 
 test("工具定义与实现同源，不会漂移", () => {

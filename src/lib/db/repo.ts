@@ -563,6 +563,23 @@ export interface BlockInput {
  * 早期版本只做其中一趟，结果两头都漏：先做位置匹配则插入一段会让后面全部
  * 块翻新 cacheKey；先要求哈希一致则每次编辑都变成"删旧建新"。
  * 两种都会把引用本文档的所有会话的 L2 缓存整体击穿。
+ *
+ * ## 为什么还需要一条「显式复原」通道（options.reviveIds）
+ *
+ * 三趟认领有一个共同的盲点：**它只看当前还活着的块**（`seq >= 0`）。
+ * 块一旦在上一轮保存里被软删，就不在候选里了，于是
+ *
+ *   - 用户撤销一次"把这段删掉了"的改写时，写回去的块会**发一个新 id**；
+ *   - `@` 引用指向的是旧 id，因此**引用不会自动接回来** ——
+ *     而内容看起来一模一样，界面上完全看不出差别。
+ *
+ * `update_doc` 允许 AI 删减内容之后，这条路径从"罕见"变成"常见"：
+ * 撤销必须能把被删掉的块按原 id 复活。所以给调用方一个显式入口 ——
+ * 传进来的 id 若命中一个**已软删、且内容与类型完全一致**的历史块，
+ * 就沿用它的 id 复活（写新 revision），而不是另起一个新块。
+ *
+ * 判据刻意严格到"内容与类型逐字相同"：这是**复原**，不是**认领**。
+ * 内容不同就该走正常的新建/改写路径，否则会把两个不相干的块混成一个。
  */
 export function saveDocBlocks(
   docId: string,
@@ -570,7 +587,13 @@ export function saveDocBlocks(
   hashFn: (text: string) => string,
   /** 上一次保存时的块 id 序列（按位置）。不传则从库里当前状态取。 */
   previousIds?: readonly (string | null)[],
-): { changed: string[]; created: string[]; removed: string[] } {
+  /**
+   * 显式复原已软删的块。传进来的 id 若命中一个已软删、且内容与类型
+   * 完全一致的历史块，就沿用它的 id 复活（而不是新建一个块）。
+   * 撤销 AI 删减内容时用它把 `@` 引用接回去。
+   */
+  options?: { reviveIds?: readonly string[] },
+): { changed: string[]; created: string[]; removed: string[]; revived: string[] } {
   const db = getDb();
   const ts = now();
   const existing = new Map(listBlocks(docId).map((b) => [b.id, b]));
@@ -588,6 +611,39 @@ export function saveDocBlocks(
   const changed: string[] = [];
   const created: string[] = [];
   const removed: string[] = [];
+  const revived: string[] = [];
+
+  /*
+   * 显式复原通道要查的东西：**这个块被软删之前长什么样**。
+   *
+   * ⚠️ 不能只看当前 revision。软删的写法是把最新 revision 的 `text` 清成空串
+   * （见下面"软删除"那段），所以"当前 revision 的内容"永远是空 ——
+   * 拿它跟新内容比，判据永远不成立，复原通道等于没接上（真实踩过）。
+   *
+   * 原文在**最近一条非空 revision** 里，取它的 `text_hash` 与 `kind`：
+   *   - `text_hash` 用来判断调用方写回的是不是同一段文字；
+   *   - `kind` 取当前 revision（软删保留了 kind，且它不会随文本清空而变）。
+   *
+   * 只查调用方点名的那几个 id，不做全表扫描 —— 一次撤销涉及的块是有限的。
+   */
+  const reviveCandidate = db.prepare<
+    [string, string, string],
+    { id: string; kind: string; seq: number; textHash: string }
+  >(
+    `SELECT cur.id            AS id,
+            cur.kind          AS kind,
+            cur.seq           AS seq,
+            last.text_hash    AS textHash
+       FROM block cur
+       JOIN (SELECT id, MAX(revision) AS rev
+               FROM block WHERE doc_id = ? GROUP BY id) m
+         ON m.id = cur.id AND m.rev = cur.revision
+       JOIN block last
+         ON last.id = cur.id
+        AND last.revision = (SELECT MAX(revision) FROM block
+                              WHERE id = cur.id AND text <> '')
+      WHERE cur.doc_id = ? AND cur.id = ?`,
+  );
 
   const insertRevision = db.prepare(
     `INSERT INTO block (id, doc_id, seq, kind, text, text_hash, revision, updated_at)
@@ -608,15 +664,44 @@ export function saveDocBlocks(
     const assigned: (string | null)[] = new Array(inputs.length).fill(null);
 
     /**
+     * 第零趟：**显式复原已软删的块**（只有撤销会用到）。
+     *
+     * 必须跑在三趟认领**之前**：那三趟都只看活着的块（`seq >= 0`），
+     * 已软删的块对它们不可见。先把点名的 id 复活，后面的趟次才不会
+     * 把它当成"新块"另发一个 id。
+     *
+     * 判据刻意严到"内容与类型逐字相同"—— 这是复原，不是认领。
+     * 内容对不上就说明调用方想写的不是原来那个块，交给正常路径处理。
+     */
+    if (options?.reviveIds && options.reviveIds.length > 0) {
+      for (let index = 0; index < inputs.length; index += 1) {
+        const wanted = inputs[index].id;
+        if (!wanted || !options.reviveIds.includes(wanted)) continue;
+        if (claimed.has(wanted)) continue;
+
+        const row = reviveCandidate.get(docId, docId, wanted);
+        if (!row) continue; // 这个 id 在这篇文档里从未存在过，或没有过非空内容
+        if (row.seq >= 0) continue; // 还活着，走正常认领
+        if (row.kind !== inputs[index].kind) continue;
+        /*
+         * 比对"被软删之前那段文字"的哈希。
+         * 对不上说明调用方想写的不是原来那个块 —— 那是改写，不是复原，
+         * 交给正常路径去发新 id，不要把它硬按到旧身份上。
+         */
+        if (row.textHash !== hashes[index]) continue;
+
+        claimed.add(wanted);
+        assigned[index] = wanted;
+        revived.push(wanted);
+      }
+    }
+
+    /**
      * 第一趟：**按内容把没变动的块优先钉死**。
      *
      * 这一趟必须跑在所有位置匹配之前。理由是"编辑"和"插入"对匹配方式的要求
      * 正好相反，而先做内容匹配能同时满足两者：
      *
-     *  - **插入一段**（最危险的情形）：从插入点起，后面每个位置的 id 提示
-     *    都整体错位、指向了前一个块。若先按位置匹配，这些块会被判定为
-     *    "内容变了"，从而集体翻新 cacheKey，把引用本文档的所有会话缓存击穿。
-     *    先按内容匹配，它们的正文逐一都能找到原主，id 原样保留。
      *  - **插入一段**（最危险的情形）：从插入点起，后面每个位置的 id 提示
      *    都整体错位、指向了前一个块。若先按位置匹配，这些块会被判定为
      *    "内容变了"，从而集体翻新 cacheKey，把引用本文档的所有会话缓存击穿。
@@ -692,6 +777,29 @@ export function saveDocBlocks(
       const claimedId = assigned[index];
 
       if (claimedId) {
+        /*
+         * ⚠️ 复活的块**不在 `existing` 里** —— `listBlocks` 按 `seq >= 0` 过滤，
+         * 已软删的块根本不在那张表里。所以不能用 `existing.get(claimedId)!`
+         * （会取到 undefined 然后崩在 `.textHash` 上）。
+         *
+         * 复活的语义很明确：内容与类型在"第零趟"已经逐字校验过，
+         * 这里必须写一条**新 revision 把 seq 摆回正数**，块才算真的活过来。
+         */
+        if (revived.includes(claimedId)) {
+          insertRevision.run({
+            id: claimedId,
+            docId,
+            seq: index,
+            kind: input.kind,
+            text: input.text,
+            textHash: hash,
+            revision: (nextRevision.get(claimedId)?.r ?? 0) + 1,
+            updatedAt: ts,
+          });
+          changed.push(claimedId);
+          return;
+        }
+
         const prev = existing.get(claimedId)!;
         if (prev.textHash === hash && prev.kind === input.kind) {
           // 内容与类型都没变，只挪位置 —— 不写新 revision
@@ -760,7 +868,7 @@ export function saveDocBlocks(
   });
 
   tx();
-  return { changed, created, removed };
+  return { changed, created, removed, revived };
 }
 
 /** 该块被多少个会话引用 —— 用于在编辑前警告"会损失多少缓存" */
@@ -1416,6 +1524,13 @@ export interface ToolCallRecord {
   error: string | null;
   /** 写入类工具：动手前的整篇 markdown */
   snapshotMarkdown: string | null;
+  /**
+   * 写入类工具：动手前的**元数据**（标题 / 父级 / 删除标记），JSON 串。
+   *
+   * 快照管内容，这一列管元数据 —— 改名、移动、删除要回滚的都不是正文。
+   * 形状与解析见 `src/lib/ai/before-state.ts`。
+   */
+  beforeState: string | null;
   targetDocId: string | null;
   createdAt: number;
 }
@@ -1431,6 +1546,7 @@ export interface ToolCallInput {
   resultSummary: string;
   error?: string | null;
   snapshotMarkdown?: string | null;
+  beforeState?: string | null;
   targetDocId?: string | null;
 }
 
@@ -1447,10 +1563,11 @@ export function recordToolCall(input: ToolCallInput): ToolCallRecord {
     .prepare(
       `INSERT INTO tool_call
          (id, conversation_id, message_id, model_config_id, round, tool_name,
-          args_json, status, result_summary, error, snapshot_markdown, target_doc_id, created_at)
+          args_json, status, result_summary, error, snapshot_markdown, before_state,
+          target_doc_id, created_at)
        VALUES (${P}id, ${P}conversationId, ${P}messageId, ${P}modelConfigId, ${P}round,
                ${P}toolName, ${P}argsJson, ${P}status, ${P}resultSummary, ${P}error,
-               ${P}snapshotMarkdown, ${P}targetDocId, ${P}createdAt)`,
+               ${P}snapshotMarkdown, ${P}beforeState, ${P}targetDocId, ${P}createdAt)`,
     )
     .run({
       id,
@@ -1464,6 +1581,7 @@ export function recordToolCall(input: ToolCallInput): ToolCallRecord {
       resultSummary: input.resultSummary,
       error: input.error ?? null,
       snapshotMarkdown: input.snapshotMarkdown ?? null,
+      beforeState: input.beforeState ?? null,
       targetDocId: input.targetDocId ?? null,
       createdAt: ts,
     });
@@ -1479,6 +1597,7 @@ export function recordToolCall(input: ToolCallInput): ToolCallRecord {
     resultSummary: input.resultSummary,
     error: input.error ?? null,
     snapshotMarkdown: input.snapshotMarkdown ?? null,
+    beforeState: input.beforeState ?? null,
     targetDocId: input.targetDocId ?? null,
     createdAt: ts,
   };
@@ -1497,6 +1616,7 @@ function rowToToolCall(row: Record<string, unknown>): ToolCallRecord {
     resultSummary: row.result_summary as string,
     error: (row.error as string | null) ?? null,
     snapshotMarkdown: (row.snapshot_markdown as string | null) ?? null,
+    beforeState: (row.before_state as string | null) ?? null,
     targetDocId: (row.target_doc_id as string | null) ?? null,
     createdAt: row.created_at as number,
   };

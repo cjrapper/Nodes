@@ -13,6 +13,8 @@
     "check:encoding": "node scripts/check-encoding.mjs src",
     "test": "node --experimental-strip-types --import ./tests/ts-resolve.mjs --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --disable-warning=ExperimentalWarning tests/run.mjs",
     "test:integration": "node scripts/integration-run.mjs",
+    "sync:export": "node scripts/sync.mjs export",
+    "sync:import": "node scripts/sync.mjs import",
     "verify": "npm run check:encoding && npm run typecheck && npm test && npm run test:integration"
   },
   "dependencies": {

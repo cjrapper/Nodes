@@ -231,6 +231,17 @@ function migrate(db: Db, schemaSql: string): void {
   ensureColumn(db, "doc", "deleted_at", "INTEGER DEFAULT NULL");
 
   /*
+   * 工具调用的元数据快照。
+   *
+   * `snapshot_markdown` 只能回滚正文；改名、移动、删除要回滚的是标题、
+   * 父级、删除标记 —— 那些不在 markdown 里。加这一列之后，"撤销"才能
+   * 覆盖全部可写工具，而不只是追加类。形状见 `src/lib/ai/before-state.ts`。
+   *
+   * 已存在的记录一律 NULL（那时还没有元数据类工具），行为不变。
+   */
+  ensureColumn(db, "tool_call", "before_state", "TEXT");
+
+  /*
    * 最大输出从 4096 提到 8192。
    *
    * 原因是一次真实故障：用推理模型（思维链会走 reasoning 通道的那种）点

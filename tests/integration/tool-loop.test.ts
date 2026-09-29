@@ -23,7 +23,7 @@ import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 
 const repo = await import("../../src/lib/db/repo.ts");
-const { runChatTurn } = await import("../../src/lib/ai/chat.ts");
+const { runChatTurn, MAX_TOOL_ROUNDS } = await import("../../src/lib/ai/chat.ts");
 
 interface Captured {
   body: Record<string, unknown>;
@@ -298,10 +298,24 @@ test("工具执行写下审计记录（含目标文档与结果摘要）", async
 });
 
 /* ================================================================== *
- * 3. 循环上限：模型一直要工具时必须停下来
+ * 3. 循环上限：模型一直要工具时必须停下来，**而且必须给结论**
  * ================================================================== */
 
-test("模型无限要求调工具时，撞上限就停，并给出可读提示", async () => {
+test("模型无限要求调工具时：用完工具轮次后强制收尾，不会哑掉", async () => {
+  /*
+   * ## 这条测试改过一次，因为实现的行为是错的
+   *
+   * 原来的实现是 `for (round < MAX_TOOL_ROUNDS)`，撞上限直接 break。
+   * 测试当时也只断言"停下来了"—— **停下来了，但模型从没机会写总结**。
+   *
+   * 真实故障（库里的记录）：模型连用 5 轮跑了 14 个 `rename_doc`，
+   * 第 5 轮结束循环退出。用户看到自己的话被接了一半然后什么都没有，
+   * 而 `status` 是 `ok`、工具全部执行成功、那个"达到上限"的提示
+   * 只是一条容易被忽略的 warning。
+   *
+   * 所以判据从"停下来"升级成"**停下来并且给结论**"：
+   * 用完预算后必须再发一次**不传 tools** 的请求，让模型把做完的事讲清楚。
+   */
   /** 每一轮都要工具，永远不给正文 */
   const endless = [
     toolCallFrame(0, "call_loop", "list_docs", "{}"),
@@ -316,37 +330,88 @@ test("模型无限要求调工具时，撞上限就停，并给出可读提示",
     const final = events.find((e) => e.type === "final");
 
     assert.ok(final?.result, "撞上限也要正常收尾，不能挂住");
-    /*
-     * 上限的判据是**请求次数**，不是"工具执行次数 - 1"。
-     *
-     * 这两者不相等，而且差在哪很容易搞错：撞上限时循环在**执行完本轮工具之后**
-     * 才发现没有下一轮了，所以"执行 5 次工具"只对应"发出 4 次后续请求"。
-     * 我第一版就是按错误的公式断言的（5 !== 4），
-     * 那是断言写错了，不是实现错了（R9）。
-     */
-    assert.ok(
-      mock.captured.length <= 6,
-      `请求次数必须有上限（实际 ${mock.captured.length} 次）—— ` +
-        `没有上限时账单会一直涨而用户只看到界面在转圈`,
-    );
-    assert.ok(
-      final.result.warnings.some((w) => /上限/.test(w)),
-      "必须明确告诉用户撞上了工具轮次上限，否则他看到的是一段没有结论的回答",
-    );
 
-    // 每一轮最多执行一次，且轮次号从 0 连续递增 —— 这才能证明循环结构是对的
+    // 每一轮最多执行一次，轮次号从 0 连续递增 —— 证明循环结构是对的
     const rounds = events
       .filter((e) => e.type === "tool_result")
       .map((e) => e.round);
     assert.deepEqual(
       rounds,
-      [0, 1, 2, 3, 4],
-      "应当恰好执行 5 轮，每轮一次，轮次号连续",
+      Array.from({ length: MAX_TOOL_ROUNDS }, (_, i) => i),
+      `工具轮次必须恰好用完预算（${MAX_TOOL_ROUNDS} 轮），且轮次号连续`,
+    );
+
+    /*
+     * 关键判据：**收尾请求真的发出去了**。
+     * 请求数 = 工具轮预算 + 1 个收尾轮。少了那个 +1 就说明
+     * 又回到了"用完就哑掉"的老行为。
+     *
+     * ⚠️ 刻意用 `MAX_TOOL_ROUNDS` 算而不是写字面量 6 ——
+     * 这个常量一改，写死的数字会让测试静默地测错东西。
+     * （我第一版就把 `makeRig(baseUrl, seq)` 的 seq 当成了轮次上限，
+     * 断言成 3 轮，结果红了两次才发现是自己读错了签名。）
+     */
+    assert.equal(
+      mock.captured.length,
+      MAX_TOOL_ROUNDS + 1,
+      `应当是 ${MAX_TOOL_ROUNDS} 个工具轮 + 1 个收尾轮（实际 ${mock.captured.length} 次请求）—— ` +
+        `没有收尾轮时用户会看到一段没有结论的回答`,
+    );
+
+    // 收尾轮必须**不带 tools**，否则模型只会继续要工具、永远收不了尾
+    const closingBody = mock.captured[mock.captured.length - 1].body as { tools?: unknown };
+    assert.equal(
+      closingBody.tools,
+      undefined,
+      "收尾轮不能传 tools —— 传了它就会继续调工具，永远给不出结论",
+    );
+
+    assert.ok(
+      final.result.warnings.some((w) => /上限/.test(w)),
+      "必须明确告诉用户撞上了工具轮次上限",
     );
     assert.equal(
       final.result.tools.length,
       rounds.length,
       "执行过的工具都要出现在结果里（前端据此渲染、用户据此撤销）",
+    );
+  } finally {
+    await mock.close();
+  }
+});
+
+test("收尾轮仍然要工具时：忽略并收口，不能死循环", async () => {
+  /*
+   * 收尾轮按设计不传 tools，正常服务商此时不会再返回 `tool_calls`。
+   * 但"正常"不能当保证 —— 兼容网关、被忽略的 tools 字段、模型幻觉，
+   * 都可能让它仍然返回。
+   *
+   * 那一瞬间如果什么都不做就继续循环，就是 `while (true)` 死循环，
+   * 而且每一轮都在追加消息、内存线性上涨。实测表现是**进程被 OOM 杀掉**
+   * （JS heap 4GB / exit 134），而不是任何断言失败 ——
+   * 极难从症状反推，所以专门用这条测试把它钉住。
+   */
+  const endless = [
+    toolCallFrame(0, "call_loop", "list_docs", "{}"),
+    toolFinishFrame(),
+  ];
+  const mock = await startSequenceMock([endless]);
+
+  try {
+    const rig = makeRig(mock.baseUrl, 4);
+    const events = await runTurn(rig);
+    const final = events.find((e) => e.type === "final");
+
+    assert.ok(final?.result, "必须收口并正常返回，而不是挂住或崩掉");
+    // 请求次数有硬上限：工具轮预算 + 收尾轮，绝不能无限涨
+    assert.ok(
+      mock.captured.length <= MAX_TOOL_ROUNDS + 1,
+      `请求次数必须有上限（实际 ${mock.captured.length}，上限 ${MAX_TOOL_ROUNDS + 1}）—— ` +
+        `无限时账单会一直涨而界面只在转圈`,
+    );
+    assert.ok(
+      final.result.warnings.some((w) => /收尾轮|上限/.test(w)),
+      "要说明收尾轮被忽略的请求数，否则用户不知道还有活没干完",
     );
   } finally {
     await mock.close();

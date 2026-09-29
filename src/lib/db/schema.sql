@@ -172,8 +172,16 @@ CREATE TABLE IF NOT EXISTS tool_call (
   status            TEXT NOT NULL DEFAULT 'ok',
   result_summary    TEXT NOT NULL DEFAULT '',
   error             TEXT,
-  /** 写入类工具：动手之前的整篇 markdown（撤销用） */
+  /** 写入类工具：动手之前的整篇 markdown（内容类撤销用） */
   snapshot_markdown TEXT,
+  /**
+   * 写入类工具：动手之前的**元数据**，JSON。
+   *
+   * 快照只能回滚"正文"，回滚不了标题、父级、删除标记 —— 而改名、移动、
+   * 删除要撤的恰恰是这些。所以撤销需要第二份记录，形状见
+   * `src/lib/ai/before-state.ts`。
+   */
+  before_state      TEXT,
   /** 写入类工具：动到的文档 id */
   target_doc_id     TEXT,
   created_at        INTEGER NOT NULL

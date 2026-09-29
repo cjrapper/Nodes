@@ -29,7 +29,16 @@ import { TOOL_SPECS, findTool, toolDefinitions } from "./tools";
  * 定成常量而不是配置项：可配置的循环上限意味着用户能把账单放开到无限，
  * 而他没有办法预判模型会循环多久。
  */
-const MAX_TOOL_ROUNDS = 5;
+/**
+ * 工具轮次预算。
+ *
+ * 语义是"**能做多少轮工具调用**"，不含最后那个强制收尾的回答轮 ——
+ * 收尾轮不占预算，因为它不允许调工具（见 `runChatTurn` 里的循环注释）。
+ *
+ * 导出是为了让测试能断言"请求数 = 预算 + 1"而不用把 5 硬编码进去：
+ * 硬编码的测试会在调这个值时静默地测错东西。
+ */
+export const MAX_TOOL_ROUNDS = 5;
 
 /** SSE 事件类型 */
 export type ChatStreamEvent =
@@ -157,6 +166,8 @@ interface ToolExecution {
   error: string | null;
   targetDocId: string | null;
   snapshotMarkdown: string | null;
+  /** 动手前的元数据（标题/父级/删除标记），撤销用 */
+  beforeState: string | null;
   /** 回传给模型的内容（**必须非空**） */
   contentForModel: string;
 }
@@ -188,6 +199,7 @@ async function executeToolCall(
     error?: string | null;
     targetDocId?: string | null;
     snapshotMarkdown?: string | null;
+    beforeState?: string | null;
   }): ToolExecution => {
     const saved = repo.recordToolCall({
       conversationId: ctx.conversationId,
@@ -200,6 +212,7 @@ async function executeToolCall(
       resultSummary: fields.summary,
       error: fields.error ?? null,
       snapshotMarkdown: fields.snapshotMarkdown ?? null,
+      beforeState: fields.beforeState ?? null,
       targetDocId: fields.targetDocId ?? null,
     });
     return {
@@ -211,6 +224,7 @@ async function executeToolCall(
       error: fields.error ?? null,
       targetDocId: fields.targetDocId ?? null,
       snapshotMarkdown: fields.snapshotMarkdown ?? null,
+      beforeState: fields.beforeState ?? null,
       contentForModel: "",
     };
   };
@@ -244,6 +258,7 @@ async function executeToolCall(
       summary: result.summary,
       targetDocId: result.targetDocId ?? null,
       snapshotMarkdown: result.snapshotMarkdown ?? null,
+      beforeState: result.beforeState ?? null,
     });
     execution.contentForModel =
       result.content.trim() === "" ? "（工具执行完毕，没有输出。）" : result.content;
@@ -493,10 +508,15 @@ export async function* runChatTurn(input: RunChatTurnInput): AsyncGenerator<Chat
    * 在被传上来之前，两种情况都只表现为"一次没有 text 的正常流"，
    * 于是错误提示只能含糊地写"可能是截断"，用户不知道该调什么。
    */
+  let finishReason = "";
+
   /**
    * 一次工具执行的轨迹（审计 + 前端展示 + 撤销都用它）。
    *
-   * `snapshotMarkdown` 只对写入类工具存在，是"一键撤销"唯一需要的东西。
+   * 撤销材料有两份、缺一不可：
+   *  - `snapshotMarkdown` 管**内容**（追加 / 改写正文）；
+   *  - `beforeState` 管**元数据**（改名 / 移动 / 删除）。
+   * 改名要撤的是标题，快照里根本没有它。
    */
   interface ToolRunRecord {
     id: string;
@@ -507,9 +527,9 @@ export async function* runChatTurn(input: RunChatTurnInput): AsyncGenerator<Chat
     error: string | null;
     targetDocId: string | null;
     snapshotMarkdown: string | null;
+    beforeState: string | null;
   }
 
-  let finishReason = "";
   /** 这一次请求最终是否以"要调工具"结束（决定要不要执行、要不要继续下一轮） */
   let wantsTools = false;
   /** 整轮里执行过的所有工具（可能跨多轮） */
@@ -528,7 +548,29 @@ export async function* runChatTurn(input: RunChatTurnInput): AsyncGenerator<Chat
   };
 
   try {
-    for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
+    /*
+     * ## 轮次上限的语义：限制**工具轮**，不限制最后一轮回答
+     *
+     * 这里曾经写成一个 `for (round < MAX_TOOL_ROUNDS)` 的循环，达到上限就
+     * `break` 出去。看起来没问题，实际是一个**真实的静默故障**：
+     *
+     * 用户点「AI 分析」，模型连续用满 5 轮做工具调用（实测一轮里跑了 14 个
+     * `rename_doc`），第 5 轮结束时循环退出 —— 它**从来没有机会写总结**。
+     * 用户看到的是自己的话被接了一半、然后什么都没有，而且：
+     *   - `status` 是 `ok`（技术上确实没报错）；
+     *   - 工具确实都执行成功了，文档真的被改了；
+     *   - 那个"达到上限"的提示只是一条 warnings，很容易被忽略。
+     *
+     * 换句话说：**工作做完了，但没人告诉你做完了什么。**
+     *
+     * 修法是把"轮次预算"和"必须给结论"拆开：
+     * 用完工具轮次之后，**再强制发一次不传 `tools` 的请求**。
+     * 不传工具时模型无法再调工具，只能把已经做完的事讲清楚。
+     * 代价是多一次 API 调用；换来的是"任何一次操作都有结论"。
+     */
+    let toolRound = 0;
+    while (true) {
+      const isFinalAnswerRound = toolRound >= MAX_TOOL_ROUNDS;
       /*
        * 每轮用**新的**累积器。跨轮复用一个会让上一轮的分片混进这一轮，
        * 拼出来的参数既不是 A 也不是 B（而且看起来像合法 JSON）。
@@ -539,7 +581,12 @@ export async function* runChatTurn(input: RunChatTurnInput): AsyncGenerator<Chat
       let roundFinish = "";
 
       for await (const event of provider.chat(
-        { messages: conversationMessages, tools: toolDefinitions(), signal: input.signal },
+        {
+          messages: conversationMessages,
+          // 收尾轮不传工具：它已经不能再动手，只能把做完的事说清楚
+          tools: isFinalAnswerRound ? undefined : toolDefinitions(),
+          signal: input.signal,
+        },
         resolved,
       )) {
         switch (event.type) {
@@ -588,6 +635,33 @@ export async function* runChatTurn(input: RunChatTurnInput): AsyncGenerator<Chat
       if (!wantsTools) {
         // 收到了分片却没以 tool_calls 结束 → 参数残缺，标记出来并且不执行
         if (toolAcc.size > 0) incompleteToolRound = true;
+        break;
+      }
+
+      /*
+       * ⚠️ 收尾轮还要求调工具 → 必须**终止**，绝不能继续循环。
+       *
+       * 收尾轮按设计不传 `tools`，正常服务商此时不会再返回 `tool_calls`。
+       * 但"正常"不能当保证用：兼容网关、被忽略的 tools 字段、
+       * 或者模型自己幻觉出一个工具调用，都可能让 finish_reason 仍是
+       * `tool_calls`。
+       *
+       * 那一瞬间如果什么都不做就往下走，`toolRound` 会继续增长、
+       * 收尾轮的判定永远是 true、模型永远要工具 —— `while (true)`
+       * **死循环，而且每一轮都在追加消息，内存线性上涨**。
+       * 实测表现是进程被 OOM 杀掉（JS heap 4GB / exit 134），
+       * 而不是任何一条断言失败 —— 极难从症状反推。
+       *
+       * 所以这里显式收口：把这一轮的调用记为"被丢弃"，说清原因，然后结束。
+       */
+      if (isFinalAnswerRound) {
+        const { calls: leftover, dropped: leftoverDropped } = toolAcc.finish();
+        droppedTools += leftover.length + leftoverDropped;
+        warnings.push(
+          `工具调用达到上限（${MAX_TOOL_ROUNDS} 轮），已停止继续调用，改用一轮不带工具的收尾回答。` +
+            `收尾轮里模型仍想调用 ${leftover.length} 个工具，这些请求已被忽略。` +
+            `本轮的改动都已落库；如果事情没做完，把任务拆小一点再让它继续。`,
+        );
         break;
       }
 
@@ -641,7 +715,7 @@ export async function* runChatTurn(input: RunChatTurnInput): AsyncGenerator<Chat
           argsText: call.argsText,
         };
 
-        const record = await executeToolCall(call, toolCtx, round);
+        const record = await executeToolCall(call, toolCtx, toolRound);
         toolRuns.push(record);
         conversationMessages.push({
           role: "tool",
@@ -654,7 +728,7 @@ export async function* runChatTurn(input: RunChatTurnInput): AsyncGenerator<Chat
           type: "tool_result",
           id: record.id,
           name: record.name,
-          round,
+          round: toolRound,
           summary: record.summary,
           status: record.status,
           isError: record.status !== "ok",
@@ -665,17 +739,62 @@ export async function* runChatTurn(input: RunChatTurnInput): AsyncGenerator<Chat
       if (aborted) break;
 
       /*
-       * 最后一轮还没结束就说明撞上了上限。必须说出来 ——
-       * 静默停下会让用户看到一段没有结论的回答，而他不知道是被截断了。
+       * 这一轮的工具都执行完了，进入下一轮。
+       *
+       * 注意这里**不 break**：超过预算时下一轮会切成"收尾轮"（不传 tools），
+       * 由它来写总结。这正是上面那段注释说的问题 —— 早先这里是
+       * `if (round === MAX_TOOL_ROUNDS - 1) { warnings.push(...) }` 之后
+       * 循环自然结束，模型永远没机会说话。
        */
-      if (round === MAX_TOOL_ROUNDS - 1) {
-        warnings.push(
-          `工具调用达到上限（${MAX_TOOL_ROUNDS} 轮），已停止继续调用。可以把问题拆小一点再问。`,
-        );
-      }
+      toolRound += 1;
     }
   } catch (err) {
     failure = err instanceof ProviderError ? err.message : String(err);
+    /*
+     * ## 中止不是"什么都没发生"
+     *
+     * 用户刷新页面、断网、或者点停止时，fetch 会抛 `ResponseAborted`。
+     * 早先这里只是把它记成 failure，然后**已经产出的东西全丢**：
+     * 流式显示的正文没了、做过的工具调用也没在回答里交代 ——
+     * 用户看到的是"我明明看着它在写，现在什么都没有"。
+     *
+     * 实测代价不小：库里有一次中止发生在**已经输出 12550 token** 之后，
+     * 那些 token 是花了钱的，而且模型当时很可能已经把结论写出来了。
+     *
+     * 所以中止要当"部分完成"处理：
+     *  1. 已经流到前端的文本**保留**（不覆盖、不清空）；
+     *  2. 明确告诉用户这是被中断的，以及已经做到了哪一步；
+     *  3. 提示做过的改动可以撤销（工具可能已经改过文档）。
+     *
+     * 判据：**用户不应该因为一次网络抖动就丢掉一次已经付过费的产出。**
+     */
+    const isAbort =
+      /abort/i.test(failure) || input.signal?.aborted === true;
+    if (isAbort) {
+      const did = text.trim().length > 0;
+      const touched = toolRuns.filter((r) => r.status === "ok").length;
+      warnings.push(
+        `这一轮被中断了（可能是刷新页面、断网，或点了停止）。` +
+          (did
+            ? `已经写出的内容保留在上面，但它**不完整** —— 重新问一次可以拿到完整回答。`
+            : `模型还没有开始写正文就被中断了。`) +
+          (touched > 0
+            ? `中断前已经成功执行了 ${touched} 次工具调用，那些改动**已经落库**，可以在工具记录里撤销。`
+            : ""),
+      );
+      /*
+       * ⚠️ 刻意**不**把 failure 清掉（虽然正文有内容）。
+       *
+       * 清掉的话这一轮会被记成 `ok`，接着被 `getLastInvocation` 当成
+       * 下一轮的**缓存基准** —— 而它是被中断的，服务商那边的缓存状态
+       * 未必和我们以为的一样，预测会凭空失真。
+       * 这正是"失败轮次不能当基准"那条规则要防的事，不能为了
+       * "让正文落库"就绕过去。
+       *
+       * 正文照样保得住：下面的落库条件是 `text.trim() || status === "error"`，
+       * 而这里 status 就是 error —— 两个目标并不冲突。
+       */
+    }
   }
 
   const latencyMs = Date.now() - startedAt;

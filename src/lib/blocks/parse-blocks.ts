@@ -160,15 +160,55 @@ export function parseMarkdown(markdown: string): ParsedBlock[] {
     // ---- 列表（含待办）----
     if (UL_RE.test(line) || OL_RE.test(line)) {
       const isTodo = TODO_RE.test(line);
-      const buf: string[] = [];
+
+      /*
+       * ⚠️ **每个顶层列表项单独成块**，而不是整个列表成一坨。
+       *
+       * 早先的实现把连续的所有列表行收进同一个块，于是
+       * `- [ ] 甲\n- [ ] 乙\n- [ ] 丙` 变成**一个**块。后果很实际：
+       *
+       *   - 待办清单里的单项**无法单独 `@` 引用**，而复盘的勾选项、
+       *     FAQ 的每一条，恰恰是最需要逐条挂进对话的东西；
+       *   - 块级元信息（cacheKey、被引用次数）覆盖的是整坨，
+       *     勾掉一条会让整坨的 cacheKey 变化；
+       *   - 一坨 100 条的待办在预览里是一整块，点哪都选中全部。
+       *
+       * 判据与段落一致：**空行分隔的每个单元是一个知识块**。
+       * 所以这里按"一项 + 它的缩进续行"切块。
+       *
+       * 注意相邻项之间**没有空行**时也切 —— 这是刻意的：
+       * Markdown 里 `- a\n- b` 是两项，不是一项。
+       * 往返无损不受影响：`serializeBlocks` 用 `\n\n` 连接，
+       * 写回去仍然是合法列表（多一个空行而已，语义不变）。
+       */
+      const buf: string[] = [line];
+      i += 1;
       while (i < lines.length) {
         const cur = lines[i];
-        const isItem = UL_RE.test(cur) || OL_RE.test(cur);
-        // 列表项的续行（缩进 2 空格以上的非空行）也归入本块
-        const isContinuation = Boolean(cur.trim()) && /^\s{2,}/.test(cur) && buf.length > 0;
-        if (!isItem && !isContinuation) break;
-        buf.push(cur);
-        i += 1;
+
+        // 下一项（顶层标记）→ 本块结束，交给下一轮循环开新块
+        if (UL_RE.test(cur) || OL_RE.test(cur)) break;
+
+        // 缩进续行（2 空格以上的非空行）归入本项
+        if (cur.trim() && /^\s{2,}/.test(cur)) {
+          buf.push(cur);
+          i += 1;
+          continue;
+        }
+
+        // 空行：只有后面紧跟缩进续行时才继续吃（列表项内的松散写法）
+        if (!cur.trim()) {
+          const next = lines[i + 1];
+          if (next !== undefined && next.trim() && /^\s{2,}/.test(next)) {
+            buf.push("");
+            i += 1;
+            continue;
+          }
+          break;
+        }
+
+        // 其它任何行 → 本块结束
+        break;
       }
       push(isTodo ? "todo" : "list", buf.join("\n"));
       continue;

@@ -6,7 +6,16 @@ next-env.d.ts
 *.tsbuildinfo
 
 # 本地数据库（你的笔记数据 —— 绝对不要提交）
+#
+# ⚠️ 千万不要改成"用网盘同步 .data/"。SQLite 是 db + wal + shm 三个文件
+# 协同工作的，网盘会把它们拆开传、或者在写入中途复制，结果是数据库不一致
+# 而且不会立刻报错 —— 你可能几天后才发现某些文档变成了旧版本。
+# 跨机器同步请走 `npm run sync:export` / `sync:import`（导出成 knowledge/ 下的
+# 纯文本，再用 git 传），细节见 knowledge/README.md。
 .data/
+
+# knowledge/ 是上面那条同步通道的产物，**要提交**（所以这里刻意不忽略它）。
+# 它只含知识库正文，不含 API 密钥、对话记录，也不含人设与规约。
 
 # 项目内重定向的 npm 缓存（见 .npmrc）
 .npm-cache/
